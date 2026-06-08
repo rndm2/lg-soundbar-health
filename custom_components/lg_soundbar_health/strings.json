@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "LG Soundbar Health",
+        "description": "Create connectivity sensors for existing LG Soundbar config entries. No host is entered here; this helper reads the existing LG Soundbar integration config."
+      }
+    },
+    "abort": {
+      "already_configured": "LG Soundbar Health is already configured."
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "LG Soundbars Health",
+  "render_readme": true,
+  "domains": ["binary_sensor", "sensor", "button", "switch"],
+  "homeassistant": "2025.12.0"
+}
