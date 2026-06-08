@@ -1,12 +1,12 @@
 {
   "domain": "lg_soundbar_health",
   "name": "LG Soundbars Health",
-  "codeowners": [],
+  "codeowners": ["@rndm2"],
   "config_flow": true,
-  "documentation": "https://github.com/home-assistant/core/tree/dev/homeassistant/components/lg_soundbar",
+  "dependencies": [],
+  "after_dependencies": ["lg_soundbar"],
+  "documentation": "https://github.com/rndm2/lg-soundbar-health",
+  "issue_tracker": "https://github.com/rndm2/lg-soundbar-health/issues",
   "iot_class": "local_polling",
-  "version": "1.7.0",
-  "after_dependencies": [
-    "lg_soundbar"
-  ]
+  "version": "1.7.0"
 }
