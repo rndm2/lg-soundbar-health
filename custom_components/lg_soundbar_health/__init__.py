@@ -29,6 +29,8 @@ from .const import (
     DOMAIN,
     SOURCE_DOMAIN,
     STORAGE_AUTO_RELOAD_ENABLED,
+    STORAGE_INITIAL_ENDPOINTS,
+    STORAGE_PARENT_RELOADS,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -170,27 +172,39 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         self._initial_endpoints: dict[str, InitialEndpoint] = {}
         self._source_state_unsub: dict[str, Any] = {}
         self._parent_reload_tasks: set[asyncio.Task[Any]] = set()
-        self._store: Store[dict[str, dict[str, bool]]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
+        self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
         self._auto_reload_enabled: dict[str, bool] = {}
+        self._parent_reload_history: dict[str, dict[str, Any]] = {}
 
     async def async_load_storage(self) -> None:
-        """Load persisted per-source switch state."""
-        stored = await self._store.async_load()
-        raw_values = (stored or {}).get(STORAGE_AUTO_RELOAD_ENABLED, {})
-        if not isinstance(raw_values, dict):
-            self._auto_reload_enabled = {}
-            return
+        """Load persisted per-source settings and diagnostic history."""
+        stored = await self._store.async_load() or {}
 
-        self._auto_reload_enabled = {
-            str(source_entry_id): bool(enabled)
-            for source_entry_id, enabled in raw_values.items()
-            if source_entry_id
-        }
+        raw_auto_reload = stored.get(STORAGE_AUTO_RELOAD_ENABLED, {})
+        if isinstance(raw_auto_reload, dict):
+            self._auto_reload_enabled = {
+                str(source_entry_id): bool(enabled)
+                for source_entry_id, enabled in raw_auto_reload.items()
+                if source_entry_id
+            }
+        else:
+            self._auto_reload_enabled = {}
+
+        self._initial_endpoints = _deserialize_initial_endpoints(
+            stored.get(STORAGE_INITIAL_ENDPOINTS, {})
+        )
+        self._parent_reload_history = _deserialize_parent_reload_history(
+            stored.get(STORAGE_PARENT_RELOADS, {})
+        )
 
     async def _async_save_storage(self) -> None:
-        """Persist per-source switch state."""
+        """Persist per-source settings and diagnostic history."""
         await self._store.async_save(
-            {STORAGE_AUTO_RELOAD_ENABLED: dict(self._auto_reload_enabled)}
+            {
+                STORAGE_AUTO_RELOAD_ENABLED: dict(self._auto_reload_enabled),
+                STORAGE_INITIAL_ENDPOINTS: _serialize_initial_endpoints(self._initial_endpoints),
+                STORAGE_PARENT_RELOADS: dict(self._parent_reload_history),
+            }
         )
 
     def discover_targets(self) -> list[SoundbarTarget]:
@@ -236,6 +250,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
                     source_entry.entry_id,
                 )
                 self._initial_endpoints.pop(source_entry.entry_id, None)
+                self.hass.async_create_task(self._async_save_storage())
                 self.hass.async_create_task(self.async_request_refresh())
 
         self._source_state_unsub[source_entry.entry_id] = source_entry.async_on_state_change(
@@ -250,6 +265,9 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         for stale_id in set(self._states) - current_ids:
             self._states.pop(stale_id, None)
             self._initial_endpoints.pop(stale_id, None)
+            self._parent_reload_history.pop(stale_id, None)
+            self._auto_reload_enabled.pop(stale_id, None)
+            self.hass.async_create_task(self._async_save_storage())
             if unsub := self._source_state_unsub.pop(stale_id, None):
                 unsub()
 
@@ -263,6 +281,8 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         state = self._states.setdefault(target.source_entry_id, HealthState(target=target))
         state.target = target
         state.auto_reload_enabled = self._auto_reload_enabled.get(target.source_entry_id, False)
+        if not state.parent_reload_in_progress:
+            self._apply_persisted_parent_reload_state(state)
 
         checked_at = datetime.now(UTC)
         current_endpoint: ResolvedEndpoint | None = None
@@ -342,6 +362,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
                 error=None,
             )
             self._initial_endpoints[target.source_entry_id] = endpoint
+            await self._async_save_storage()
             return endpoint
 
         try:
@@ -358,6 +379,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
                 error=_format_error(err),
             )
             self._initial_endpoints[target.source_entry_id] = endpoint
+            await self._async_save_storage()
             return endpoint
 
         endpoint = InitialEndpoint(
@@ -369,11 +391,13 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
             error=None,
         )
         self._initial_endpoints[target.source_entry_id] = endpoint
+        await self._async_save_storage()
         return endpoint
 
     async def async_reset_initial_endpoint(self, source_entry_id: str) -> None:
         """Reset the frozen initial IP snapshot for one source entry."""
         self._initial_endpoints.pop(source_entry_id, None)
+        await self._async_save_storage()
         await self.async_request_refresh()
 
     async def async_set_auto_reload(self, source_entry_id: str, enabled: bool) -> None:
@@ -401,7 +425,9 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         source_entry = self._get_source_entry(source_entry_id)
         if source_entry is None:
             state.parent_reload_last_error = "Source LG Soundbar config entry not found"
+            self._persist_parent_reload_state(state)
             self.async_set_updated_data(dict(self._states))
+            await self._async_save_storage()
             return
 
         state.parent_reload_in_progress = True
@@ -409,7 +435,9 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         state.parent_reload_last_error = None
         state.last_parent_reload = datetime.now(UTC)
         state.parent_reload_count += 1
+        self._persist_parent_reload_state(state)
         self.async_set_updated_data(dict(self._states))
+        await self._async_save_storage()
 
         try:
             reload_result = await self.hass.config_entries.async_reload(source_entry.entry_id)
@@ -428,8 +456,35 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
                 self._initial_endpoints.pop(source_entry.entry_id, None)
         finally:
             state.parent_reload_in_progress = False
+            self._persist_parent_reload_state(state)
             self.async_set_updated_data(dict(self._states))
+            await self._async_save_storage()
             await self.async_request_refresh()
+
+    def _apply_persisted_parent_reload_state(self, state: HealthState) -> None:
+        """Restore parent reload history into a runtime state."""
+        raw = self._parent_reload_history.get(state.target.source_entry_id)
+        if not raw:
+            state.parent_reload_last_reason = state.parent_reload_last_reason or "never"
+            return
+
+        state.last_parent_reload = _parse_datetime(raw.get("last_parent_reload"))
+        state.parent_reload_count = _parse_non_negative_int(raw.get("parent_reload_count"), 0)
+        state.parent_reload_last_reason = (
+            ha_safe_text(raw.get("parent_reload_last_reason"), fallback="never") or "never"
+        )
+        state.parent_reload_last_error = ha_safe_text(raw.get("parent_reload_last_error"))
+
+    def _persist_parent_reload_state(self, state: HealthState) -> None:
+        """Store parent reload history for a source entry."""
+        self._parent_reload_history[state.target.source_entry_id] = {
+            "last_parent_reload": _datetime_to_storage(state.last_parent_reload),
+            "parent_reload_count": state.parent_reload_count,
+            "parent_reload_last_reason": (
+                ha_safe_text(state.parent_reload_last_reason, fallback="never") or "never"
+            ),
+            "parent_reload_last_error": ha_safe_text(state.parent_reload_last_error),
+        }
 
     def _maybe_schedule_auto_reload(self, state: HealthState) -> None:
         """Schedule a parent reload if the guarded auto-reload condition is met."""
@@ -541,6 +596,127 @@ async def async_unload_entry(hass: HomeAssistant, entry: LGSoundbarHealthConfigE
         if data and (coordinator := data.get(DATA_COORDINATOR)):
             coordinator.async_shutdown()
     return unload_ok
+
+
+def _serialize_initial_endpoints(endpoints: dict[str, InitialEndpoint]) -> dict[str, dict[str, Any]]:
+    """Serialize initial endpoints for Home Assistant storage."""
+    data: dict[str, dict[str, Any]] = {}
+    for source_entry_id, endpoint in endpoints.items():
+        data[source_entry_id] = {
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "ip_address": endpoint.ip_address,
+            "family": int(endpoint.family) if endpoint.family is not None else None,
+            "captured_at": _datetime_to_storage(endpoint.captured_at),
+            "error": ha_safe_text(endpoint.error),
+        }
+    return data
+
+
+def _deserialize_initial_endpoints(raw: Any) -> dict[str, InitialEndpoint]:
+    """Deserialize initial endpoints from Home Assistant storage."""
+    if not isinstance(raw, dict):
+        return {}
+
+    endpoints: dict[str, InitialEndpoint] = {}
+    for source_entry_id, payload in raw.items():
+        if not source_entry_id or not isinstance(payload, dict):
+            continue
+
+        host = ha_safe_text(payload.get("host"))
+        if host is None:
+            continue
+
+        port = _parse_port(payload.get("port"), DEFAULT_PORT)
+        ip_address = ha_safe_text(payload.get("ip_address"))
+        family = _parse_socket_family(payload.get("family"))
+        if ip_address is None or family is None:
+            ip_address = None
+            family = None
+
+        endpoints[str(source_entry_id)] = InitialEndpoint(
+            host=host,
+            port=port,
+            ip_address=ip_address,
+            family=family,
+            captured_at=_parse_datetime(payload.get("captured_at")),
+            error=ha_safe_text(payload.get("error")),
+        )
+
+    return endpoints
+
+
+def _deserialize_parent_reload_history(raw: Any) -> dict[str, dict[str, Any]]:
+    """Deserialize parent reload history from Home Assistant storage."""
+    if not isinstance(raw, dict):
+        return {}
+
+    history: dict[str, dict[str, Any]] = {}
+    for source_entry_id, payload in raw.items():
+        if not source_entry_id or not isinstance(payload, dict):
+            continue
+
+        history[str(source_entry_id)] = {
+            "last_parent_reload": _datetime_to_storage(
+                _parse_datetime(payload.get("last_parent_reload"))
+            ),
+            "parent_reload_count": _parse_non_negative_int(
+                payload.get("parent_reload_count"), 0
+            ),
+            "parent_reload_last_reason": (
+                ha_safe_text(payload.get("parent_reload_last_reason"), fallback="never")
+                or "never"
+            ),
+            "parent_reload_last_error": ha_safe_text(payload.get("parent_reload_last_error")),
+        }
+
+    return history
+
+
+def _parse_socket_family(raw_value: Any) -> socket.AddressFamily | None:
+    """Parse a stored socket address family."""
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        family = socket.AddressFamily(value)
+    except ValueError:
+        return None
+
+    if family in (socket.AF_INET, socket.AF_INET6):
+        return family
+    return None
+
+
+def _parse_datetime(raw_value: Any) -> datetime | None:
+    """Parse a stored ISO datetime."""
+    if not isinstance(raw_value, str) or not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _datetime_to_storage(value: datetime | None) -> str | None:
+    """Serialize a datetime for storage."""
+    if value is None:
+        return None
+    return value.astimezone(UTC).isoformat()
+
+
+def _parse_non_negative_int(raw_value: Any, fallback: int) -> int:
+    """Parse a non-negative integer."""
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return fallback
+    return max(0, value)
 
 
 def _parse_scan_interval_seconds(raw_value: Any, fallback: int) -> int:
