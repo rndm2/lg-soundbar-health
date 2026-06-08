@@ -33,6 +33,7 @@ from .const import (
     DEFAULT_TIMEOUT,
     DOMAIN,
     SOURCE_DOMAIN,
+    STORAGE_AUTO_RELOAD_ENABLED,
     STORAGE_INITIAL_ENDPOINTS,
     STORAGE_PARENT_RELOADS,
     STORAGE_KEY,
@@ -600,33 +601,54 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         self._parent_reload_tasks.clear()
 
 
+
 async def _async_ensure_default_options(
     hass: HomeAssistant,
     entry: LGSoundbarHealthConfigEntry,
 ) -> None:
-    """Ensure options exist and migrate old per-target auto-reload storage."""
-    options = dict(entry.options)
-    changed = False
+    """Ensure options exist and migrate the old auto-reload storage flag.
 
-    if CONF_SCAN_INTERVAL_SECONDS not in options:
-        options[CONF_SCAN_INTERVAL_SECONDS] = DEFAULT_SCAN_INTERVAL_SECONDS
-        changed = True
+    Version 1.8.2 moved auto reload from a switch entity into config entry
+    options. Existing installs can still have the old per-source storage map.
+    This migration must be best-effort and must never block integration setup.
+    """
+    current_options = dict(entry.options)
 
-    if CONF_AUTO_RELOAD not in options:
-        legacy_auto_reload = DEFAULT_AUTO_RELOAD
-        stored = await Store(hass, STORAGE_VERSION, STORAGE_KEY).async_load() or {}
+    stored_auto_reload = DEFAULT_AUTO_RELOAD
+    if CONF_AUTO_RELOAD not in current_options:
+        try:
+            stored = await Store(hass, STORAGE_VERSION, STORAGE_KEY).async_load() or {}
+        except Exception as err:  # noqa: BLE001 - migration must not break setup
+            _LOGGER.debug(
+                "Could not load LG Soundbars Health storage while migrating options: %s",
+                err,
+            )
+            stored = {}
+
         raw_auto_reload = stored.get(STORAGE_AUTO_RELOAD_ENABLED, {})
         if isinstance(raw_auto_reload, dict):
-            legacy_auto_reload = any(bool(value) for value in raw_auto_reload.values())
-        options[CONF_AUTO_RELOAD] = legacy_auto_reload
-        changed = True
+            stored_auto_reload = any(bool(value) for value in raw_auto_reload.values())
+        elif isinstance(raw_auto_reload, bool):
+            stored_auto_reload = raw_auto_reload
 
-    if CONF_NOTIFY_ON_RELOAD not in options:
-        options[CONF_NOTIFY_ON_RELOAD] = DEFAULT_NOTIFY_ON_RELOAD
-        changed = True
+    updated_options = {
+        CONF_AUTO_RELOAD: bool(
+            current_options.get(CONF_AUTO_RELOAD, stored_auto_reload)
+        ),
+        CONF_NOTIFY_ON_RELOAD: bool(
+            current_options.get(CONF_NOTIFY_ON_RELOAD, DEFAULT_NOTIFY_ON_RELOAD)
+        ),
+        CONF_SCAN_INTERVAL_SECONDS: _parse_scan_interval_seconds(
+            current_options.get(
+                CONF_SCAN_INTERVAL_SECONDS,
+                DEFAULT_SCAN_INTERVAL_SECONDS,
+            ),
+            DEFAULT_SCAN_INTERVAL_SECONDS,
+        ),
+    }
 
-    if changed:
-        hass.config_entries.async_update_entry(entry, options=options)
+    if updated_options != current_options:
+        hass.config_entries.async_update_entry(entry, options=updated_options)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: LGSoundbarHealthConfigEntry) -> bool:

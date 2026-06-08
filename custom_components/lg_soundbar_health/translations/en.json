@@ -7,7 +7,7 @@
     "step": {
       "user": {
         "title": "LG Soundbars Health",
-        "description": "Create connectivity sensors for existing LG Soundbars config entries. No host is entered here; this helper reads the existing LG Soundbars integration config."
+        "description": "Create health sensors for existing LG Soundbars integration entries. No IP address is needed here."
       }
     }
   },
