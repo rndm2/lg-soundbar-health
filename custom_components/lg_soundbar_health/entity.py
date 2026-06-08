@@ -25,13 +25,8 @@ class LGSoundbarHealthEntity(CoordinatorEntity[LGSoundbarHealthCoordinator]):
         super().__init__(coordinator)
         self._source_entry_id = source_entry_id
         self._linked_device_entry: DeviceEntry | None = self._find_source_device()
-
-        # Home Assistant helper integrations must link their helper entities to
-        # the source device this way. Returning the source device's identifiers
-        # from device_info would implicitly add this helper config entry to the
-        # source device, which is deprecated and stops working in newer HA.
         if self._linked_device_entry is not None:
-            self.device_entry = self._linked_device_entry
+            self._attr_device_info = self._source_device_info(self._linked_device_entry)
 
     def _find_source_device(self) -> DeviceEntry | None:
         """Return the native LG Soundbar device for the source config entry."""
@@ -40,6 +35,39 @@ class LGSoundbarHealthEntity(CoordinatorEntity[LGSoundbarHealthCoordinator]):
         if not source_devices:
             return None
         return source_devices[0]
+
+
+    def _source_device_info(self, source_device: DeviceEntry) -> DeviceInfo:
+        """Return device info that attaches helper entities to the native device.
+
+        This intentionally mirrors the Ring helper approach: reuse the native
+        device registry identifiers/connections so Home Assistant shows this
+        helper integration on the same device page as the source integration.
+        """
+        device_info: DeviceInfo = {}
+        if source_device.identifiers:
+            device_info["identifiers"] = set(source_device.identifiers)
+        if source_device.connections:
+            device_info["connections"] = set(source_device.connections)
+        if source_device.name_by_user or source_device.name:
+            device_info["name"] = source_device.name_by_user or source_device.name
+        if source_device.manufacturer:
+            device_info["manufacturer"] = source_device.manufacturer
+        if source_device.model:
+            device_info["model"] = source_device.model
+        if source_device.sw_version:
+            device_info["sw_version"] = source_device.sw_version
+        if source_device.hw_version:
+            device_info["hw_version"] = source_device.hw_version
+        if device_info.get("identifiers") or device_info.get("connections"):
+            return device_info
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, self._source_entry_id)},
+            name=source_device.name_by_user or source_device.name or "LG Soundbars Health",
+            manufacturer="LG",
+            model="Soundbars health monitor",
+        )
 
     @property
     def health_state(self) -> HealthState | None:
@@ -59,13 +87,9 @@ class LGSoundbarHealthEntity(CoordinatorEntity[LGSoundbarHealthCoordinator]):
 
     @property
     def device_info(self) -> DeviceInfo | None:
-        """Return fallback device info only if no native device is available.
-
-        When the native LG Soundbar device exists, this method returns ``None``
-        because the entity is already linked through ``self.device_entry``.
-        """
+        """Return fallback device info only if no native device is available."""
         if self._linked_device_entry is not None:
-            return None
+            return self._source_device_info(self._linked_device_entry)
 
         state = self.health_state
         if state is None:
