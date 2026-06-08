@@ -1,14 +1,14 @@
 {
   "config": {
-    "abort": {
-      "already_configured": "LG Soundbars Health is already configured.",
-      "no_lg_soundbar_entries": "No existing LG Soundbar integration entries with a host were found. Configure the LG Soundbar integration first."
-    },
     "step": {
       "user": {
         "title": "LG Soundbars Health",
-        "description": "Create health sensors for existing LG Soundbar integration entries. No IP address is needed here."
+        "description": "Create connectivity sensors for existing LG Soundbars config entries. No host is entered here; this helper reads the existing LG Soundbars integration config."
       }
+    },
+    "abort": {
+      "already_configured": "LG Soundbars Health is already configured.",
+      "no_lg_soundbar_entries": "No existing LG Soundbars integration entries with a host were found. Configure the LG Soundbars integration first."
     }
   },
   "options": {
