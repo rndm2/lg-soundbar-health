@@ -10,6 +10,7 @@ import socket
 import time
 from typing import Any
 
+from homeassistant.components.persistent_notification import DOMAIN as NOTIFY_DOMAIN
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PORT, Platform
 from homeassistant.core import HomeAssistant, callback
@@ -18,7 +19,11 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     DATA_COORDINATOR,
+    CONF_AUTO_RELOAD,
+    CONF_NOTIFY_ON_RELOAD,
+    DEFAULT_AUTO_RELOAD,
     DEFAULT_AUTO_RELOAD_INITIAL_FAILURES,
+    DEFAULT_NOTIFY_ON_RELOAD,
     DEFAULT_PARENT_RELOAD_COOLDOWN,
     DEFAULT_PORT,
     DEFAULT_SCAN_INTERVAL_SECONDS,
@@ -28,7 +33,6 @@ from .const import (
     DEFAULT_TIMEOUT,
     DOMAIN,
     SOURCE_DOMAIN,
-    STORAGE_AUTO_RELOAD_ENABLED,
     STORAGE_INITIAL_ENDPOINTS,
     STORAGE_PARENT_RELOADS,
     STORAGE_KEY,
@@ -62,7 +66,6 @@ PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,
     Platform.SENSOR,
     Platform.BUTTON,
-    Platform.SWITCH,
 ]
 
 LGSoundbarHealthConfigEntry = ConfigEntry
@@ -173,22 +176,27 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         self._source_state_unsub: dict[str, Any] = {}
         self._parent_reload_tasks: set[asyncio.Task[Any]] = set()
         self._store: Store[dict[str, Any]] = Store(hass, STORAGE_VERSION, STORAGE_KEY)
-        self._auto_reload_enabled: dict[str, bool] = {}
         self._parent_reload_history: dict[str, dict[str, Any]] = {}
+
+    @property
+    def auto_reload_enabled(self) -> bool:
+        """Return whether guarded automatic parent reload is enabled."""
+        return bool(
+            self._config_entry.options.get(CONF_AUTO_RELOAD, DEFAULT_AUTO_RELOAD)
+        )
+
+    @property
+    def notify_on_reload(self) -> bool:
+        """Return whether reloads should create persistent notifications."""
+        return bool(
+            self._config_entry.options.get(
+                CONF_NOTIFY_ON_RELOAD, DEFAULT_NOTIFY_ON_RELOAD
+            )
+        )
 
     async def async_load_storage(self) -> None:
         """Load persisted per-source settings and diagnostic history."""
         stored = await self._store.async_load() or {}
-
-        raw_auto_reload = stored.get(STORAGE_AUTO_RELOAD_ENABLED, {})
-        if isinstance(raw_auto_reload, dict):
-            self._auto_reload_enabled = {
-                str(source_entry_id): bool(enabled)
-                for source_entry_id, enabled in raw_auto_reload.items()
-                if source_entry_id
-            }
-        else:
-            self._auto_reload_enabled = {}
 
         self._initial_endpoints = _deserialize_initial_endpoints(
             stored.get(STORAGE_INITIAL_ENDPOINTS, {})
@@ -201,7 +209,6 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         """Persist per-source settings and diagnostic history."""
         await self._store.async_save(
             {
-                STORAGE_AUTO_RELOAD_ENABLED: dict(self._auto_reload_enabled),
                 STORAGE_INITIAL_ENDPOINTS: _serialize_initial_endpoints(self._initial_endpoints),
                 STORAGE_PARENT_RELOADS: dict(self._parent_reload_history),
             }
@@ -266,7 +273,6 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
             self._states.pop(stale_id, None)
             self._initial_endpoints.pop(stale_id, None)
             self._parent_reload_history.pop(stale_id, None)
-            self._auto_reload_enabled.pop(stale_id, None)
             self.hass.async_create_task(self._async_save_storage())
             if unsub := self._source_state_unsub.pop(stale_id, None):
                 unsub()
@@ -280,7 +286,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         """Check one target by resolving its host and opening TCP connections."""
         state = self._states.setdefault(target.source_entry_id, HealthState(target=target))
         state.target = target
-        state.auto_reload_enabled = self._auto_reload_enabled.get(target.source_entry_id, False)
+        state.auto_reload_enabled = self.auto_reload_enabled
         if not state.parent_reload_in_progress:
             self._apply_persisted_parent_reload_state(state)
 
@@ -400,15 +406,6 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         await self._async_save_storage()
         await self.async_request_refresh()
 
-    async def async_set_auto_reload(self, source_entry_id: str, enabled: bool) -> None:
-        """Enable or disable automatic parent integration reload for one source entry."""
-        self._auto_reload_enabled[source_entry_id] = enabled
-        state = self._states.get(source_entry_id)
-        if state is not None:
-            state.auto_reload_enabled = enabled
-            self.async_set_updated_data(dict(self._states))
-        await self._async_save_storage()
-
     async def async_reload_parent(self, source_entry_id: str, reason: str = "manual") -> None:
         """Reload the parent LG Soundbar config entry."""
         state = self._states.get(source_entry_id)
@@ -439,6 +436,7 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         self.async_set_updated_data(dict(self._states))
         await self._async_save_storage()
 
+        reload_succeeded = False
         try:
             reload_result = await self.hass.config_entries.async_reload(source_entry.entry_id)
         except Exception as err:  # noqa: BLE001 - reload failures must stay diagnostic
@@ -452,14 +450,46 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
             if reload_result is False:
                 state.parent_reload_last_error = "Home Assistant returned false while reloading source config entry"
             else:
+                reload_succeeded = True
                 state.parent_reload_last_error = None
                 self._initial_endpoints.pop(source_entry.entry_id, None)
         finally:
+            if self.notify_on_reload:
+                await self._async_create_reload_notification(state, reload_succeeded)
             state.parent_reload_in_progress = False
             self._persist_parent_reload_state(state)
             self.async_set_updated_data(dict(self._states))
             await self._async_save_storage()
             await self.async_request_refresh()
+
+    async def _async_create_reload_notification(
+        self,
+        state: HealthState,
+        reload_succeeded: bool,
+    ) -> None:
+        """Create a persistent notification for a parent reload attempt."""
+        status = "succeeded" if reload_succeeded else "failed"
+        message = (
+            f"Reload of LG Soundbars config entry for {state.target.name} {status}.\n\n"
+            f"Reason: {state.parent_reload_last_reason or 'unknown'}\n"
+            f"Initial IP: {state.initial_ip or 'unknown'}\n"
+            f"Resolved IP: {state.resolved_ip or 'unknown'}"
+        )
+        if state.parent_reload_last_error:
+            message += f"\nError: {state.parent_reload_last_error}"
+
+        await self.hass.services.async_call(
+            NOTIFY_DOMAIN,
+            "create",
+            {
+                "title": "LG Soundbars Health",
+                "message": message,
+                "notification_id": (
+                    f"lg_soundbar_health_reload_{state.target.source_entry_id}"
+                ),
+            },
+            blocking=False,
+        )
 
     def _apply_persisted_parent_reload_state(self, state: HealthState) -> None:
         """Restore parent reload history into a runtime state."""
@@ -570,8 +600,38 @@ class LGSoundbarHealthCoordinator(DataUpdateCoordinator[dict[str, HealthState]])
         self._parent_reload_tasks.clear()
 
 
+async def _async_ensure_default_options(
+    hass: HomeAssistant,
+    entry: LGSoundbarHealthConfigEntry,
+) -> None:
+    """Ensure options exist and migrate old per-target auto-reload storage."""
+    options = dict(entry.options)
+    changed = False
+
+    if CONF_SCAN_INTERVAL_SECONDS not in options:
+        options[CONF_SCAN_INTERVAL_SECONDS] = DEFAULT_SCAN_INTERVAL_SECONDS
+        changed = True
+
+    if CONF_AUTO_RELOAD not in options:
+        legacy_auto_reload = DEFAULT_AUTO_RELOAD
+        stored = await Store(hass, STORAGE_VERSION, STORAGE_KEY).async_load() or {}
+        raw_auto_reload = stored.get(STORAGE_AUTO_RELOAD_ENABLED, {})
+        if isinstance(raw_auto_reload, dict):
+            legacy_auto_reload = any(bool(value) for value in raw_auto_reload.values())
+        options[CONF_AUTO_RELOAD] = legacy_auto_reload
+        changed = True
+
+    if CONF_NOTIFY_ON_RELOAD not in options:
+        options[CONF_NOTIFY_ON_RELOAD] = DEFAULT_NOTIFY_ON_RELOAD
+        changed = True
+
+    if changed:
+        hass.config_entries.async_update_entry(entry, options=options)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: LGSoundbarHealthConfigEntry) -> bool:
     """Set up LG Soundbars Health from a config entry."""
+    await _async_ensure_default_options(hass, entry)
     coordinator = LGSoundbarHealthCoordinator(hass, entry)
     await coordinator.async_load_storage()
     await coordinator.async_config_entry_first_refresh()

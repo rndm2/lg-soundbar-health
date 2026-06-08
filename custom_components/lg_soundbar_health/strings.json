@@ -2,12 +2,26 @@
   "config": {
     "step": {
       "user": {
-        "title": "LG Soundbar Health",
-        "description": "Create connectivity sensors for existing LG Soundbar config entries. No host is entered here; this helper reads the existing LG Soundbar integration config."
+        "title": "LG Soundbars Health",
+        "description": "Create connectivity sensors for existing LG Soundbars config entries. No host is entered here; this helper reads the existing LG Soundbars integration config."
       }
     },
     "abort": {
-      "already_configured": "LG Soundbar Health is already configured."
+      "already_configured": "LG Soundbars Health is already configured.",
+      "no_lg_soundbar_entries": "No existing LG Soundbars integration entries with a host were found. Configure the LG Soundbars integration first."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "auto_reload": "Auto reload LG Soundbar",
+          "notify_on_reload": "Create a persistent notification on reload",
+          "scan_interval_seconds": "Health check interval, seconds"
+        },
+        "title": "LG Soundbars Health options",
+        "description": "Configure reload behavior and how often the LG soundbar TCP health check runs."
+      }
     }
   }
 }

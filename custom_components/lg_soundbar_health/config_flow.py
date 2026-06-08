@@ -8,9 +8,14 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.const import CONF_HOST
+from homeassistant.helpers import selector
 
 from .const import (
+    CONF_AUTO_RELOAD,
+    CONF_NOTIFY_ON_RELOAD,
     CONF_SCAN_INTERVAL_SECONDS,
+    DEFAULT_AUTO_RELOAD,
+    DEFAULT_NOTIFY_ON_RELOAD,
     DEFAULT_SCAN_INTERVAL_SECONDS,
     DOMAIN,
     MAX_SCAN_INTERVAL_SECONDS,
@@ -41,7 +46,11 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title="LG Soundbars Health",
             data={},
-            options={CONF_SCAN_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL_SECONDS},
+            options={
+                CONF_AUTO_RELOAD: DEFAULT_AUTO_RELOAD,
+                CONF_NOTIFY_ON_RELOAD: DEFAULT_NOTIFY_ON_RELOAD,
+                CONF_SCAN_INTERVAL_SECONDS: DEFAULT_SCAN_INTERVAL_SECONDS,
+            },
         )
 
     @staticmethod
@@ -59,14 +68,40 @@ class OptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
         """Manage integration options."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
+            data = dict(user_input)
+            data[CONF_AUTO_RELOAD] = bool(
+                data.get(CONF_AUTO_RELOAD, DEFAULT_AUTO_RELOAD)
+            )
+            data[CONF_NOTIFY_ON_RELOAD] = bool(
+                data.get(CONF_NOTIFY_ON_RELOAD, DEFAULT_NOTIFY_ON_RELOAD)
+            )
+            data[CONF_SCAN_INTERVAL_SECONDS] = _parse_scan_interval_option(
+                data.get(CONF_SCAN_INTERVAL_SECONDS)
+            )
+            return self.async_create_entry(title="", data=data)
 
         current_interval = _parse_scan_interval_option(
             self._config_entry.options.get(CONF_SCAN_INTERVAL_SECONDS),
         )
+        current_auto_reload = bool(
+            self._config_entry.options.get(CONF_AUTO_RELOAD, DEFAULT_AUTO_RELOAD)
+        )
+        current_notify_on_reload = bool(
+            self._config_entry.options.get(
+                CONF_NOTIFY_ON_RELOAD, DEFAULT_NOTIFY_ON_RELOAD
+            )
+        )
 
         schema = vol.Schema(
             {
+                vol.Optional(
+                    CONF_AUTO_RELOAD,
+                    default=current_auto_reload,
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_NOTIFY_ON_RELOAD,
+                    default=current_notify_on_reload,
+                ): selector.BooleanSelector(),
                 vol.Required(
                     CONF_SCAN_INTERVAL_SECONDS,
                     default=current_interval,
@@ -76,7 +111,7 @@ class OptionsFlow(config_entries.OptionsFlow):
                         min=MIN_SCAN_INTERVAL_SECONDS,
                         max=MAX_SCAN_INTERVAL_SECONDS,
                     ),
-                )
+                ),
             }
         )
 
